@@ -66,16 +66,10 @@ def convert_water_to_cwt(water, wavelet='morl'):
     scales = np.arange(1, future_steps + 1)
     signal = np.copy(water)
 
-    # 计算CWT
     coefficients, _ = pywt.cwt(signal, scales, wavelet)
 
-    # 防止爆炸：处理 inf 和 nan
     coefficients = np.nan_to_num(coefficients, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    # 防止系数太大：归一化处理
-    # max_abs = np.max(np.abs(coefficients)) + 1e-8  # 防止除零
-    # coefficients = coefficients / max_abs
-    # 增加通道维度
     cwt_future = coefficients[..., np.newaxis]
     return cwt_future
 def convert_rain_to_cwt(rain, wavelet='mexh'):
@@ -83,17 +77,10 @@ def convert_rain_to_cwt(rain, wavelet='mexh'):
     scales = np.arange(1, future_steps + 1)
     signal = np.copy(rain)
 
-    # 计算CWT
     coefficients, _ = pywt.cwt(signal, scales, wavelet)
 
-    # 防止爆炸：处理 inf 和 nan
     coefficients = np.nan_to_num(coefficients, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    # 防止系数太大：归一化处理
-    # max_abs = np.max(np.abs(coefficients)) + 1e-8
-    # coefficients = coefficients / max_abs
-
-    # 增加通道维度
     cwt_future = coefficients[..., np.newaxis]
     return cwt_future
 class TimeSeriesCWTDataset(Dataset):
@@ -103,9 +90,8 @@ class TimeSeriesCWTDataset(Dataset):
         self.history_steps = history_steps
         self.future_steps = future_steps
         self.threshold = threshold
-        # 样本数量 = T - (history_steps + future_steps) + 1
         self.num_samples = data.shape[0] - (history_steps + future_steps) + 1
-        self.filtered_indices = self.filter_indices()  # 先筛选出符合条件的索引
+        self.filtered_indices = self.filter_indices()
         self.mode=mode
         self.water_mean = water_mean
         self.water_std = water_std
@@ -116,25 +102,19 @@ class TimeSeriesCWTDataset(Dataset):
         return len(self.filtered_indices)
 
     def filter_indices(self):
-        """筛选出符合条件的索引"""
         indices = []
         for idx in range(self.num_samples):
             target = self.data[idx + self.history_steps: idx + self.history_steps + self.future_steps, 0]  # shape (32,)
-            if np.any(target > self.threshold):  # 如果 target 中有值超过 threshold
-                indices.append(idx)  # 记录索引
-        return np.array(indices)  # 返回筛选后的索引数组
+            if np.any(target > self.threshold):
+                indices.append(idx)
+        return np.array(indices)
 
     def __getitem__(self, idx):
         idx = self.filtered_indices[idx]
-        # 1. 提取样本：
-        # 历史数据：从 idx 到 idx+history_steps，形状 (history_steps, 2)
         sample_history = self.data[idx: idx + self.history_steps, :]
         sample_water = sample_history[:, 0].copy()
         sample_rain = sample_history[:, 1].copy()
-        # 未来数据：取未来 future_steps 个时间步，
-        # 未来降雨：取第二列，形状 (future_steps,)
         future_rain = self.data[idx + self.history_steps: idx + self.history_steps + self.future_steps, 1].copy()
-        # 目标：未来水位，即第一列，形状 (future_steps,)
         target = self.data[idx + self.history_steps: idx + self.history_steps + self.future_steps, 0].copy()
         raw_input= np.stack([sample_water, sample_rain, future_rain], axis=1)
         # sample_water = (sample_water - self.water_mean) / self.water_std
@@ -143,25 +123,16 @@ class TimeSeriesCWTDataset(Dataset):
         # target = (target - self.water_mean) / self.water_std
 
         cluster_label = self.cluster_model.predict([raw_input])[0]
-        # 2. 使用 CWT 将一维时间序列转换成二维表示：
-        # 对历史数据进行 CWT，得到形状 (history_steps, history_steps, 2)
         cwt_history_water = convert_water_to_cwt(sample_water, 'morl')
         cwt_history_rain = convert_rain_to_cwt(sample_rain)
-        # 对未来降雨数据进行 CWT，得到形状 (future_steps, future_steps, 1)
         cwt_future = convert_rain_to_cwt(future_rain)
 
-        # 3. 拼接各通道：
-        # 假设 history_steps == future_steps == 32，此时拼接后 input_image 形状为 (32, 32, 3)
         input_image = np.concatenate([cwt_history_water, cwt_history_rain, cwt_future], axis=-1)
 
-        # 4. 类型转换及维度调整：
         input_image = input_image.astype(np.float32)
-        target = target.astype(np.float32)  # shape: (32,1)
-        # PyTorch 要求输入 shape: (channels, height, width)
-        # 当前 input_image shape: (32, 32, 3) -> 转置到 (3, 32, 32)
+        target = target.astype(np.float32)
         input_image = np.transpose(input_image, (2, 0, 1))
 
-        # 5. 转换为 tensor 返回
         input_tensor = torch.tensor(input_image)
         target_tensor = torch.tensor(target)
         cluster_tensor = torch.tensor(cluster_label, dtype=torch.long)
@@ -172,59 +143,43 @@ class CNNExpert(nn.Module):
         super().__init__()
 
         self.conv = nn.Sequential(
-            # 第一层：Grouped 卷积，每个输入通道独立处理（适配 Grad-CAM）
             nn.Conv2d(3, 3, kernel_size=3, padding=1, groups=3),  # (B,3,8,32) → (B,3,8,32)
             nn.ReLU(),
-            # nn.Dropout2d(0.5),
 
-            # 第二层：融合通道特征
             nn.Conv2d(3, 32, kernel_size=3, padding=1),  # → (B,32,8,32)
             nn.ReLU(),
-            # nn.Dropout2d(0.5),
 
-            # 第三层：进一步提取特征
+
             nn.Conv2d(32, 64, kernel_size=3, padding=1),  # → (B,64,8,32)
             nn.ReLU(),
-            # nn.Dropout2d(0.5),
 
-            # 池化：只降采样时间维度（W），保持尺度信息
-            nn.MaxPool2d(kernel_size=(1, 2)),  # → (B,64,8,16)
 
-            # 第四层：增加通道维度
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),  # → (B,128,8,16)
+            nn.MaxPool2d(kernel_size=(1, 2)),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            # nn.Dropout2d(0.5),
+
         )
 
-        # 最终全连接层（使用全局平均池化）
         self.head = nn.Linear(128, out_steps)
 
     def forward(self, x):
-        x = self.conv(x)  # → (B,128,8,16)
-        x = x.mean(dim=(2, 3))  # GAP → (B,128)
-        return self.head(x)  # → (B,32)
+        x = self.conv(x)
+        x = x.mean(dim=(2, 3))
+        return self.head(x)
 class GatingCNN(nn.Module):
 
     def __init__(self, num_experts: int):
         super().__init__()
-        # 一层 1×1 卷积：3 -> num_experts
         self.conv1x1 = nn.Conv2d(in_channels=3,
                                  out_channels=num_experts,
                                  kernel_size=1,
                                  bias=True)
-        # self.dropout = nn.Dropout2d(0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, 3, H, W)  这里 H=8, W=32
-        returns: (B, num_experts) 还没做 softmax
-        """
-        # 1×1 卷积 -> (B, num_experts, H, W)
+
         g = self.conv1x1(x)
-        # 全局平均池化到 (B, num_experts, 1, 1)
         g = g.mean(dim=[2, 3], keepdim=False)
-        # g = self.dropout(g)
-        # 输出 (B, num_experts)
         return g
 class SoftMoE_CNN(nn.Module):
     def __init__(self, num_experts, out_steps, input_shape=(3,8,32)):
@@ -240,8 +195,7 @@ class SoftMoE_CNN(nn.Module):
         out = (gate_w * expert_outs).sum(1)             # (B, O)
 
         return (out, gate_logits) if return_gating else out
-    # def forward(self, x, k=17):
-    #     return self.experts[k](x)
+
 
 cluster_model = joblib.load(
     f'times_explainability/softmoe/{catchment}_{history_steps}_{future_steps}_clustering_{expert_num}.pkl'
